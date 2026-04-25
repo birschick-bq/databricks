@@ -22,12 +22,14 @@
 */
 
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Http;
 using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
+using AdbcDrivers.HiveServer2;
 using Apache.Arrow.Adbc;
 using Apache.Arrow.Adbc.Tracing;
 
@@ -328,10 +330,17 @@ namespace AdbcDrivers.Databricks
                 return false;
             }
 
-            // HttpRequestException: connection refused, DNS failure, TCP reset, etc.
-            if (ex is HttpRequestException)
+            // HttpRequestException: connection refused, TCP reset, etc.
+            if (ex is HttpRequestException httpEx)
             {
-                return true;
+#if NET8_0_OR_GREATER
+                if (httpEx.HttpRequestError == HttpRequestError.NameResolutionError
+                    || httpEx.HttpRequestError == HttpRequestError.ConnectionError)
+                {
+                    return false;
+                }
+#endif
+                return httpEx.InnerException == null || IsTransientTransportException(httpEx.InnerException, cancellationToken);
             }
 
             // IOException: connection dropped mid-transfer
@@ -340,10 +349,21 @@ namespace AdbcDrivers.Databricks
                 return true;
             }
 
-            // SocketException: low-level network errors (wrapped or standalone)
-            if (ex is SocketException)
+            // WebException/SocketException: low-level network errors (wrapped or standalone)
+            if (ex is WebException webEx)
             {
-                return true;
+                return webEx.Status != WebExceptionStatus.NameResolutionFailure
+                    && webEx.Status != WebExceptionStatus.ConnectFailure
+                    && webEx.Status != WebExceptionStatus.Timeout
+                    && webEx.InnerException == null
+                    || IsTransientTransportException(webEx.InnerException, cancellationToken);
+            }
+            if (ex is SocketException sockEx)
+            {
+                return sockEx.SocketErrorCode != SocketError.HostNotFound
+                    && sockEx.SocketErrorCode != SocketError.TimedOut
+                    && sockEx.SocketErrorCode != SocketError.ConnectionRefused
+                    || IsTransientTransportException(sockEx.InnerException, cancellationToken);
             }
 
             // TaskCanceledException NOT caused by the caller's token.

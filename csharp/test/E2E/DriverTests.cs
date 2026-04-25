@@ -89,24 +89,27 @@ namespace AdbcDrivers.Databricks.Tests
             Assert.NotNull(driver);
             Dictionary<string, string> parameters = GetDriverParameters(TestConfiguration);
 
-            bool hasUri = parameters.TryGetValue(AdbcOptions.Uri, out var uri) && !string.IsNullOrEmpty(uri);
-            bool hasHostName = parameters.TryGetValue(SparkParameters.HostName, out var hostName) && !string.IsNullOrEmpty(hostName);
-            if (hasUri)
+            foreach (var host in new[] { "unknownhost.azure.com" /*, "192.0.2.1"*/ })
             {
-                parameters[AdbcOptions.Uri] = "http://unknownhost.azure.com/cliservice";
-            }
-            else if (hasHostName)
-            {
-                parameters[SparkParameters.HostName] = "unknownhost.azure.com";
-            }
-            else
-            {
-                Assert.Fail($"Unexpected configuration. Must provide '{AdbcOptions.Uri}' or '{SparkParameters.HostName}'.");
-            }
+                bool hasUri = parameters.TryGetValue(AdbcOptions.Uri, out var uri) && !string.IsNullOrEmpty(uri);
+                bool hasHostName = parameters.TryGetValue(SparkParameters.HostName, out var hostName) && !string.IsNullOrEmpty(hostName);
+                if (hasUri)
+                {
+                    parameters[AdbcOptions.Uri] = $"http://{host}/cliservice";
+                }
+                else if (hasHostName)
+                {
+                    parameters[SparkParameters.HostName] = host;
+                }
+                else
+                {
+                    Assert.Fail($"Unexpected configuration. Must provide '{AdbcOptions.Uri}' or '{SparkParameters.HostName}'.");
+                }
 
-            AdbcDatabase database = driver.Open(parameters);
-            AdbcException exception = Assert.ThrowsAny<AdbcException>(() => database.Connect(parameters));
-            OutputHelper?.WriteLine(exception.Message);
+                AdbcDatabase database = driver.Open(parameters);
+                AdbcException exception = Assert.ThrowsAny<AdbcException>(() => database.Connect(parameters));
+                OutputHelper?.WriteLine(exception.Message);
+            }
         }
 
         public override void CanDetectInvalidAuthentication()

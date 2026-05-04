@@ -112,7 +112,7 @@ namespace AdbcDrivers.Databricks.Tests
             AdbcException exception = Assert.ThrowsAny<AdbcException>(() => database.Connect(parameters));
             stopwatch.Stop();
             OutputHelper?.WriteLine($"host: '{host}' - elapsed time: {stopwatch.Elapsed} - \n{exception.Message}");
-            Assert.InRange(stopwatch.Elapsed, TimeSpan.FromSeconds(0), TimeSpan.FromMinutes(3));
+            Assert.InRange(stopwatch.Elapsed, TimeSpan.FromSeconds(0), TimeSpan.FromMinutes(1));
         }
 
         public override void CanDetectInvalidAuthentication()

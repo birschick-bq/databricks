@@ -23,6 +23,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Threading.Tasks;
 using Apache.Arrow.Adbc;
 using AdbcDrivers.HiveServer2.Spark;
@@ -88,8 +89,9 @@ namespace AdbcDrivers.Databricks.Tests
             AdbcDriver driver = NewDriver;
             Assert.NotNull(driver);
             Dictionary<string, string> parameters = GetDriverParameters(TestConfiguration);
+            Stopwatch stopwatch = new();
 
-            foreach (var host in new[] { "unknownhost.azure.com" /*, "192.0.2.1"*/ })
+            foreach (var host in new[] { "unknownhost.azure.com", "192.0.2.1" })
             {
                 bool hasUri = parameters.TryGetValue(AdbcOptions.Uri, out var uri) && !string.IsNullOrEmpty(uri);
                 bool hasHostName = parameters.TryGetValue(SparkParameters.HostName, out var hostName) && !string.IsNullOrEmpty(hostName);
@@ -106,9 +108,12 @@ namespace AdbcDrivers.Databricks.Tests
                     Assert.Fail($"Unexpected configuration. Must provide '{AdbcOptions.Uri}' or '{SparkParameters.HostName}'.");
                 }
 
+                stopwatch.Restart();
                 AdbcDatabase database = driver.Open(parameters);
                 AdbcException exception = Assert.ThrowsAny<AdbcException>(() => database.Connect(parameters));
-                OutputHelper?.WriteLine(exception.Message);
+                stopwatch.Stop();
+                OutputHelper?.WriteLine($"host: '{host}' - elapsed time: {stopwatch.Elapsed} - \n{exception.Message}");
+                Assert.InRange(stopwatch.Elapsed, TimeSpan.FromSeconds(0), TimeSpan.FromMinutes(3));
             }
         }
 

@@ -349,7 +349,14 @@ namespace AdbcDrivers.Databricks
                 return true;
             }
 
-            // WebException/SocketException: low-level network errors (wrapped or standalone)
+            // SocketException/WebException: low-level network errors (wrapped or standalone)
+            if (ex is SocketException sockEx)
+            {
+                return sockEx.SocketErrorCode != SocketError.HostNotFound
+                    && sockEx.SocketErrorCode != SocketError.TimedOut
+                    && sockEx.SocketErrorCode != SocketError.ConnectionRefused
+                    || IsTransientTransportException(sockEx.InnerException, cancellationToken);
+            }
             if (ex is WebException webEx)
             {
                 return webEx.Status != WebExceptionStatus.NameResolutionFailure
@@ -357,13 +364,6 @@ namespace AdbcDrivers.Databricks
                     && webEx.Status != WebExceptionStatus.Timeout
                     && webEx.InnerException == null
                     || IsTransientTransportException(webEx.InnerException, cancellationToken);
-            }
-            if (ex is SocketException sockEx)
-            {
-                return sockEx.SocketErrorCode != SocketError.HostNotFound
-                    && sockEx.SocketErrorCode != SocketError.TimedOut
-                    && sockEx.SocketErrorCode != SocketError.ConnectionRefused
-                    || IsTransientTransportException(sockEx.InnerException, cancellationToken);
             }
 
             // TaskCanceledException NOT caused by the caller's token.

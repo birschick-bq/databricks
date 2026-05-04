@@ -353,7 +353,6 @@ namespace AdbcDrivers.Databricks
             if (ex is SocketException sockEx)
             {
                 return sockEx.SocketErrorCode != SocketError.HostNotFound
-                    && sockEx.SocketErrorCode != SocketError.TimedOut
                     && sockEx.SocketErrorCode != SocketError.ConnectionRefused
                     || IsTransientTransportException(sockEx.InnerException, cancellationToken);
             }
@@ -361,7 +360,6 @@ namespace AdbcDrivers.Databricks
             {
                 return webEx.Status != WebExceptionStatus.NameResolutionFailure
                     && webEx.Status != WebExceptionStatus.ConnectFailure
-                    && webEx.Status != WebExceptionStatus.Timeout
                     && webEx.InnerException == null
                     || IsTransientTransportException(webEx.InnerException, cancellationToken);
             }

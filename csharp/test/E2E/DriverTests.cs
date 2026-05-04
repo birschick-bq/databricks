@@ -91,7 +91,7 @@ namespace AdbcDrivers.Databricks.Tests
             Dictionary<string, string> parameters = GetDriverParameters(TestConfiguration);
             Stopwatch stopwatch = new();
 
-            foreach (var host in new[] { "unknownhost.azure.com", "192.0.2.1" })
+            foreach (var host in new[] { "unknownhost.azure.com" })
             {
                 bool hasUri = parameters.TryGetValue(AdbcOptions.Uri, out var uri) && !string.IsNullOrEmpty(uri);
                 bool hasHostName = parameters.TryGetValue(SparkParameters.HostName, out var hostName) && !string.IsNullOrEmpty(hostName);

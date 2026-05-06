@@ -360,8 +360,15 @@ namespace AdbcDrivers.Databricks.StatementExecution
                     }));
             }
 
-            // Create appropriate reader based on result disposition
+            // Create appropriate reader based on result disposition.
+            // All paths (inline, CloudFetch, empty) expose the manifest schema so that
+            // IntervalSerializingStream and ComplexTypeSerializingStream can detect columns
+            // uniformly via Spark:DataType:SqlName metadata rather than Arrow IPC types.
             IArrowArrayStream reader = CreateReader(response, cancellationToken);
+
+            // SEA emits YearMonthIntervalType and DurationType; Thrift emits StringType for intervals.
+            // Convert interval/duration columns to canonical UTF-8 strings to match Thrift behavior.
+            reader = new IntervalSerializingStream(reader);
 
             // When EnableComplexDatatypeSupport=false (default), serialize complex Arrow types to JSON strings
             // so that SEA behavior matches Thrift (which sets ComplexTypesAsArrow=false).
@@ -481,25 +488,24 @@ namespace AdbcDrivers.Databricks.StatementExecution
             if (hasExternalLinks)
             {
                 // Use CloudFetch for external links
-                return CreateCloudFetchReader(response);
+                return CreateCloudFetchReader(response, GetSchemaFromManifest(response.Manifest));
             }
             else if (response.Result != null && response.Result.Attachment != null && response.Result.Attachment.Length > 0)
             {
                 // Check if data is LZ4 compressed
                 bool isLz4Compressed = response.Manifest?.ResultCompression?.ToUpperInvariant() == "LZ4_FRAME";
 
-                // Inline results - may be split across multiple chunks
+                // Inline results - may be split across multiple chunks.
+                // Pass the manifest schema so the reader reports it instead of the IPC-embedded schema,
+                // keeping inline consistent with CloudFetch (which also uses the manifest schema).
                 int totalChunks = response.Manifest?.Chunks?.Count ?? 1;
                 return new InlineArrowStreamReader(_client, _currentStatementId!, response.Result.Attachment,
-                    isLz4Compressed, totalChunks, _lz4BufferPool, cancellationToken);
+                    isLz4Compressed, totalChunks, _lz4BufferPool, cancellationToken, GetSchemaFromManifest(response.Manifest));
             }
             else
             {
-                // No data rows, but the manifest contains schema information.
-                // Preserve the schema so callers get correct column metadata even
-                // when the queried table is empty — following the same pattern as
-                // the JDBC driver where ResultManifest schema is always extracted
-                // independently of data presence.
+                // No data rows (e.g. DDL): manifest may have columns_count=0.
+                // Fall back to an empty schema rather than throwing so DDL statements succeed.
                 Schema schema = TryGetSchemaFromManifest(response.Manifest) ?? new Schema.Builder().Build();
                 return new EmptyArrowArrayStream(schema);
             }
@@ -508,12 +514,10 @@ namespace AdbcDrivers.Databricks.StatementExecution
         /// <summary>
         /// Creates a CloudFetch reader for external link results.
         /// </summary>
-        private IArrowArrayStream CreateCloudFetchReader(ExecuteStatementResponse response)
+        private IArrowArrayStream CreateCloudFetchReader(ExecuteStatementResponse response, Schema manifestSchema)
         {
             var manifest = response.Manifest!;
-
-            // Build schema from manifest
-            var schema = GetSchemaFromManifest(manifest);
+            var schema = manifestSchema;
 
             // The Statement Execution API response structure:
             // - manifest.chunks: Array of ChunkInfo with metadata for ALL chunks (row counts, offsets, etc.)
@@ -546,9 +550,34 @@ namespace AdbcDrivers.Databricks.StatementExecution
         }
 
         /// <summary>
-        /// Tries to extract the Arrow schema from the result manifest.
-        /// Returns <c>null</c> when the manifest contains no column definitions,
-        /// allowing callers to decide on a fallback (e.g. empty schema for no-data results).
+        /// Builds an Arrow <see cref="Schema"/> from the SEA result manifest, or returns
+        /// <c>null</c> when the manifest contains no column definitions.
+        ///
+        /// <para>
+        /// This schema is used by all three result paths (inline, CloudFetch, empty) so
+        /// that every path exposes the same schema to callers — matching the JDBC driver,
+        /// which uses the manifest schema exclusively and treats Arrow IPC bytes as a data
+        /// source only.
+        /// </para>
+        ///
+        /// <para>
+        /// Each field carries <see cref="ColumnMetadataHelper.ArrowMetadataKey"/>
+        /// (<c>Spark:DataType:SqlName</c>) in its metadata. For Thrift results the server
+        /// embeds this key directly in the Arrow IPC field metadata; for SEA results it may
+        /// be absent from the IPC. By computing it here from the manifest type name and
+        /// embedding it on every field, we give <see cref="IntervalSerializingStream"/> and
+        /// <see cref="ComplexTypeSerializingStream"/> a reliable detection signal regardless
+        /// of result path. JDBC achieves the same effect by falling back to
+        /// <c>ColumnInfo.typeText</c> (the raw manifest type string) when the IPC metadata
+        /// key is absent.
+        /// </para>
+        ///
+        /// <para>
+        /// INTERVAL, ARRAY, MAP, and STRUCT columns are mapped to <see cref="StringType"/>
+        /// because the stream wrappers convert the native Arrow arrays to strings. The
+        /// declared Arrow type and the actual array type in each batch must always agree;
+        /// this is the output contract.
+        /// </para>
         /// </summary>
         private Schema? TryGetSchemaFromManifest(ResultManifest manifest)
         {
@@ -560,20 +589,11 @@ namespace AdbcDrivers.Databricks.StatementExecution
             var fields = new List<Field>();
             foreach (var column in manifest.Schema.Columns)
             {
-                var typeName = column.TypeName ?? string.Empty;
-                var arrowType = MapDatabricksTypeToArrowType(typeName);
-                // Embed the SQL type name as Arrow field metadata so that consumers
-                // (e.g. the PowerBI connector's AdjustNativeTypes) can read it via
-                // the "Spark:DataType:SqlName" key — the same metadata the Databricks
-                // server embeds in the Arrow IPC stream for non-empty results.
-                //
-                // Note: the Thrift server also sets "Spark:DataType:JsonType" (the JSON
-                // representation of the type, e.g. "{\"type\":\"integer\"}") alongside
-                // SqlName. That key is not read by any known consumer today, so we omit
-                // it here for now. Add it if a consumer requires it (PECO-2950).
+                var typeText = column.TypeText ?? string.Empty;
+                var arrowType = MapDatabricksTypeToArrowType(typeText);
                 var metadata = new Dictionary<string, string>
                 {
-                    ["Spark:DataType:SqlName"] = ColumnMetadataHelper.GetSparkSqlName(typeName)
+                    [ColumnMetadataHelper.ArrowMetadataKey] = typeText
                 };
                 fields.Add(new Field(column.Name, arrowType, true, metadata));
             }
@@ -582,12 +602,19 @@ namespace AdbcDrivers.Databricks.StatementExecution
         }
 
         /// <summary>
-        /// Maps Databricks SQL type names to Arrow types.
+        /// Maps a Databricks SQL type name from the manifest to its Arrow output type.
+        ///
+        /// <para>
+        /// INTERVAL, ARRAY, MAP, and STRUCT are mapped to <see cref="StringType"/> because
+        /// <see cref="IntervalSerializingStream"/> and <see cref="ComplexTypeSerializingStream"/>
+        /// convert the native Arrow arrays (e.g. <c>YearMonthIntervalArray</c>, <c>ListArray</c>)
+        /// to <see cref="StringArray"/> at read time. The manifest schema is the output contract
+        /// exposed to callers, so the declared type must match the converted data type.
+        /// </para>
         /// </summary>
         private IArrowType MapDatabricksTypeToArrowType(string typeName)
         {
-            // Handle parameterized types (e.g., DECIMAL(10,2), VARCHAR(100))
-            var baseType = typeName.Split('(')[0].ToUpperInvariant();
+            var baseType = ColumnMetadataHelper.GetBaseTypeName(typeName).ToUpperInvariant();
 
             return baseType switch
             {
@@ -603,12 +630,12 @@ namespace AdbcDrivers.Databricks.StatementExecution
                 "BINARY" or "VARBINARY" => BinaryType.Default,
                 "DATE" => Date32Type.Default,
                 "TIMESTAMP" or "TIMESTAMP_NTZ" or "TIMESTAMP_LTZ" => TimestampType.Default,
-                "INTERVAL" => StringType.Default, // Intervals as strings for now
-                "ARRAY" => StringType.Default, // Complex types as strings for now
-                "MAP" => StringType.Default,
-                "STRUCT" => StringType.Default,
+                // Converted to string by IntervalSerializingStream; StringType is the output contract.
+                "INTERVAL" => StringType.Default,
+                // Converted to JSON string by ComplexTypeSerializingStream; StringType is the output contract.
+                "ARRAY" or "MAP" or "STRUCT" => StringType.Default,
                 "NULL" or "VOID" => NullType.Default,
-                _ => StringType.Default // Default to string for unknown types
+                _ => StringType.Default
             };
         }
 
@@ -808,6 +835,7 @@ namespace AdbcDrivers.Databricks.StatementExecution
         {
             private readonly ArrowStreamReader _streamReader;
             private readonly System.IO.MemoryStream _memoryStream;
+            private readonly Schema _schema;
             private bool _disposed;
 
             public InlineArrowStreamReader(
@@ -817,7 +845,8 @@ namespace AdbcDrivers.Databricks.StatementExecution
                 bool isLz4Compressed,
                 int totalChunks,
                 System.Buffers.ArrayPool<byte> bufferPool,
-                CancellationToken cancellationToken)
+                CancellationToken cancellationToken,
+                Schema manifestSchema)
             {
                 if (firstChunkData == null || firstChunkData.Length == 0)
                 {
@@ -829,9 +858,29 @@ namespace AdbcDrivers.Databricks.StatementExecution
 
                 _memoryStream = new System.IO.MemoryStream(allData);
                 _streamReader = new ArrowStreamReader(_memoryStream);
+                // Validate that the IPC schema column count matches the manifest schema.
+                // Type mismatches are expected (manifest uses StringType for interval/complex columns),
+                // but a count mismatch indicates a server bug or version skew and should fail loudly.
+                var ipcFieldCount = _streamReader.Schema.FieldsList.Count;
+                if (manifestSchema.FieldsList.Count != ipcFieldCount)
+                {
+                    var manifestFields = string.Join(", ", manifestSchema.FieldsList.Select(f => f.Name));
+                    var ipcFields = string.Join(", ", _streamReader.Schema.FieldsList.Select(f => f.Name));
+                    throw new AdbcException(
+                        $"Manifest schema has {manifestSchema.FieldsList.Count} fields but IPC data has {ipcFieldCount} fields. " +
+                        $"Manifest: [{manifestFields}], IPC: [{ipcFields}]");
+                }
+                // Use the manifest schema as the reported schema rather than the IPC-embedded schema.
+                // Arrow IPC files are self-describing, but the IPC schema carries native types
+                // (YearMonthIntervalType, ListType, etc.) while callers expect the output contract
+                // declared by the manifest (StringType for interval and complex columns). Keeping
+                // inline consistent with CloudFetch — which already uses GetSchemaFromManifest —
+                // lets IntervalSerializingStream and ComplexTypeSerializingStream detect and convert
+                // columns uniformly via Spark:DataType:SqlName metadata on every path.
+                _schema = manifestSchema;
             }
 
-            public Schema Schema => _streamReader.Schema;
+            public Schema Schema => _schema;
 
             public async ValueTask<RecordBatch?> ReadNextRecordBatchAsync(CancellationToken cancellationToken = default)
             {
